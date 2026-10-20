@@ -421,10 +421,6 @@ export function buildMutationInputType({
   const fieldName = formatName(name)
 
   const fieldSchemas = fields.reduce((inputObjectTypeConfig, field) => {
-    if ('hidden' in field && field.hidden) {
-      return inputObjectTypeConfig
-    }
-
     const fieldSchema = fieldToSchemaMap[field.type]
 
     if (typeof fieldSchema !== 'function') {
