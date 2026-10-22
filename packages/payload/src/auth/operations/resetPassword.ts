@@ -12,8 +12,9 @@ import { httpStatus } from '../../utilities/httpStatus.js'
 import { initTransaction } from '../../utilities/initTransaction.js'
 import { killTransaction } from '../../utilities/killTransaction.js'
 import { applyUserReadAccess } from '../applyUserReadAccess.js'
-import { createAuthToken } from '../createAuthToken.js'
-import { revokeSession } from '../sessions.js'
+import { getFieldsToSign } from '../getFieldsToSign.js'
+import { jwtSign } from '../jwt.js'
+import { addSessionToUser, revokeSession } from '../sessions.js'
 import { authenticateLocalStrategy } from '../strategies/local/authenticate.js'
 import { generatePasswordSaltHash } from '../strategies/local/generatePasswordSaltHash.js'
 
@@ -41,7 +42,10 @@ export const resetPasswordOperation = async <TSlug extends AuthCollectionSlug>(
     data,
     depth,
     overrideAccess = false,
-    req: { payload },
+    req: {
+      payload: { secret },
+      payload,
+    },
     req,
   } = args
 
@@ -155,15 +159,27 @@ export const resetPasswordOperation = async <TSlug extends AuthCollectionSlug>(
     user.collection = collectionConfig.slug
     user._strategy = 'local-jwt'
 
-    const { token, ...session } = await createAuthToken({
+    const fieldsToSignArgs: Parameters<typeof getFieldsToSign>[0] = {
       collectionConfig,
       email: user.email!,
+      user,
+    }
+
+    const session = await addSessionToUser({
+      collectionConfig,
+      payload,
       req,
       user,
     })
 
     sessionUser = user
     sid = session.sid
+
+    if (sid) {
+      fieldsToSignArgs.sid = sid
+    }
+
+    const fieldsToSign = getFieldsToSign(fieldsToSignArgs)
 
     // /////////////////////////////////////
     // beforeLogin - Collection
@@ -180,6 +196,12 @@ export const resetPasswordOperation = async <TSlug extends AuthCollectionSlug>(
           })) || user
       }
     }
+
+    const { token } = await jwtSign({
+      fieldsToSign,
+      secret,
+      tokenExpiration: collectionConfig.auth.tokenExpiration,
+    })
 
     req.user = user
 

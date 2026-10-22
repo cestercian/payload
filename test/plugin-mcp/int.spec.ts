@@ -4194,6 +4194,18 @@ test.suite('@payloadcms/plugin-mcp', { config: './config.ts', resetBetweenTests:
   test.describe('OAuth authorization server', () => {
     const redirectURI = 'http://localhost:33418/callback'
 
+    const getUser = ({
+      accessToken,
+      restClient,
+    }: {
+      accessToken: string
+      restClient: RESTClient
+    }) =>
+      restClient
+        .GET('/users/me', { auth: false, headers: { Authorization: `JWT ${accessToken}` } })
+        .then((res) => res.json())
+        .then(({ user }) => user)
+
     // What the user's browser does: open the sign-in link while logged in, then click Allow
     const approve = async ({ query, restClient }: { query: string; restClient: RESTClient }) => {
       const headers = { Authorization: `JWT ${await getLoginToken(restClient)}` }
@@ -4215,6 +4227,52 @@ test.suite('@payloadcms/plugin-mcp', { config: './config.ts', resetBetweenTests:
           body: JSON.stringify({ client_name: 'Test client', redirect_uris: [redirectURI] }),
         })
         .then((res) => res.json())
+
+    // What an MCP client does to sign in, up to receiving the authorization code
+    const startSignIn = async (restClient: RESTClient) => {
+      const { client_id } = await register(restClient)
+      const codeVerifier = `${randomUUID()}${randomUUID()}`
+      const code = await approve({
+        query: `?${new URLSearchParams({
+          client_id,
+          code_challenge: createHash('sha256').update(codeVerifier).digest('base64url'),
+          code_challenge_method: 'S256',
+          redirect_uri: redirectURI,
+          response_type: 'code',
+        })}`,
+        restClient,
+      })
+
+      return { client_id, code, codeVerifier }
+    }
+
+    const requestToken = ({
+      params,
+      restClient,
+    }: {
+      params: Record<string, string>
+      restClient: RESTClient
+    }) =>
+      restClient.POST('/mcp/oauth/token', {
+        body: new URLSearchParams(params).toString(),
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      })
+
+    const signIn = async (restClient: RESTClient) => {
+      const { client_id, code, codeVerifier } = await startSignIn(restClient)
+      const tokens = await requestToken({
+        params: {
+          client_id,
+          code,
+          code_verifier: codeVerifier,
+          grant_type: 'authorization_code',
+          redirect_uri: redirectURI,
+        },
+        restClient,
+      }).then((res) => res.json())
+
+      return { client_id, tokens }
+    }
 
     test('should sign MCP clients in through the admin login', async ({ payload, restClient }) => {
       enableOAuth(payload, { type: 'builtin' })
@@ -4278,32 +4336,72 @@ test.suite('@payloadcms/plugin-mcp', { config: './config.ts', resetBetweenTests:
       restClient,
     }) => {
       enableOAuth(payload, { type: 'builtin' })
-      const { client_id } = await register(restClient)
-      const codeVerifier = `${randomUUID()}${randomUUID()}`
-      const code = await approve({
-        query: `?${new URLSearchParams({
-          client_id,
-          code_challenge: createHash('sha256').update(codeVerifier).digest('base64url'),
-          code_challenge_method: 'S256',
-          redirect_uri: redirectURI,
-          response_type: 'code',
-        })}`,
-        restClient,
-      })
-      const requestToken = (verifier: string) =>
-        restClient.POST('/mcp/oauth/token', {
-          body: new URLSearchParams({
+      const { client_id, code, codeVerifier } = await startSignIn(restClient)
+      const redeem = (verifier: string) =>
+        requestToken({
+          params: {
             client_id,
             code,
             code_verifier: verifier,
             grant_type: 'authorization_code',
             redirect_uri: redirectURI,
-          }).toString(),
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          },
+          restClient,
         })
 
-      expect((await requestToken('wrong-verifier')).status).toBe(400)
-      expect((await requestToken(codeVerifier)).status).toBe(200)
+      expect((await redeem('wrong-verifier')).status).toBe(400)
+      expect((await redeem(codeVerifier)).status).toBe(200)
+    })
+
+    test('should give clients new tokens for their refresh token', async ({
+      payload,
+      restClient,
+    }) => {
+      enableOAuth(payload, { type: 'builtin' })
+      const { client_id, tokens } = await signIn(restClient)
+      const refresh = (clientID: string) =>
+        requestToken({
+          params: {
+            client_id: clientID,
+            grant_type: 'refresh_token',
+            refresh_token: tokens.refresh_token,
+          },
+          restClient,
+        })
+
+      // Only the client the refresh token was issued to can use it
+      expect((await refresh('another-client')).status).toBe(400)
+
+      const refreshed = await refresh(client_id).then((res) => res.json())
+
+      expect(refreshed.refresh_token).not.toBe(tokens.refresh_token)
+      expect(await getUser({ accessToken: refreshed.access_token, restClient })).toMatchObject({
+        email: devUser.email,
+      })
+    })
+
+    test('should sign clients out when a used refresh token comes back later', async ({
+      payload,
+      restClient,
+    }) => {
+      enableOAuth(payload, { type: 'builtin' })
+      const { client_id, tokens } = await signIn(restClient)
+      const refresh = (refreshToken: string) =>
+        requestToken({
+          params: { client_id, grant_type: 'refresh_token', refresh_token: refreshToken },
+          restClient,
+        })
+      const refreshed = await refresh(tokens.refresh_token).then((res) => res.json())
+
+      // Right after a refresh, the client may be refreshing twice at once
+      expect((await refresh(tokens.refresh_token)).status).toBe(200)
+
+      vi.useFakeTimers({ now: Date.now() + 60 * 1000, toFake: ['Date'] })
+      onTestFinished(() => vi.useRealTimers())
+
+      expect((await refresh(tokens.refresh_token)).status).toBe(400)
+      expect((await refresh(refreshed.refresh_token)).status).toBe(400)
+      expect(await getUser({ accessToken: refreshed.access_token, restClient })).toBeNull()
     })
 
     test('should send users who are not logged in to the admin login', async ({

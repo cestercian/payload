@@ -7,13 +7,13 @@ import type { Endpoint, PayloadHandler, PayloadRequest } from 'payload'
 
 import { OAuthErrorCode } from '@modelcontextprotocol/server'
 import { createHash } from 'crypto'
-import { APIError, createAuthToken } from 'payload'
 import { formatAdminURL } from 'payload/shared'
 
-import type { MCPBuiltinOAuthConfig } from '../types.js'
+import type { MCPBuiltinOAuthConfig, MCPOAuthTokens } from '../types.js'
 
 import { getPluginConfig } from '../utils/getPluginConfig.js'
 import { getMCPURL } from './oauth.js'
+import { issueLoginToken, refreshLoginToken } from './oauthLoginToken.js'
 
 type Client = { name: string; redirectURIs: string[] }
 
@@ -27,20 +27,25 @@ type Consent = {
 }
 
 type Code = {
-  accessToken: string
   clientID: string
   codeChallenge: string
-  expiresIn?: number
   redirectURI: string
+  tokens: MCPOAuthTokens
+}
+
+type RefreshToken = {
+  clientID: string
+  refreshToken: string
 }
 
 /**
  * Turns Payload into the OAuth authorization server for MCP clients when `oauth.type` is
  * `'builtin'`. Clients register, the user allows them after logging in to the admin panel, and
- * the client receives the access token `issueToken` creates.
+ * the client receives the tokens `issueToken` creates.
  *
- * Clients, consent forms, and authorization codes are encrypted and handed to the client instead
- * of being stored, so nothing is written to the database.
+ * Clients, consent forms, authorization codes, and refresh tokens are encrypted and handed to the
+ * client instead of being stored. Only the default tokens write to the database, to the user's
+ * login sessions.
  */
 export const oauthServerEndpoints: Endpoint[] = [
   {
@@ -100,7 +105,7 @@ const metadataResponse = (issuer: string): Response =>
     {
       authorization_endpoint: `${issuer}/authorize`,
       code_challenge_methods_supported: ['S256'],
-      grant_types_supported: ['authorization_code'],
+      grant_types_supported: ['authorization_code', 'refresh_token'],
       // Required by OpenID discovery. No ID tokens are issued.
       id_token_signing_alg_values_supported: ['RS256'],
       issuer,
@@ -136,7 +141,7 @@ const register: PayloadHandler = async (req) => {
     {
       client_id: seal({ type: 'client', data: client, req }),
       client_name: client.name,
-      grant_types: ['authorization_code'],
+      grant_types: ['authorization_code', 'refresh_token'],
       redirect_uris: client.redirectURIs,
       response_types: ['code'],
       token_endpoint_auth_method: 'none',
@@ -223,11 +228,12 @@ const approve: PayloadHandler = async (req) => {
     return redirect({ params: { error: OAuthErrorCode.AccessDenied, state }, redirectURI })
   }
 
-  const { issueToken = issueLoginToken } = getPluginConfig({ config: req.payload.config })
-    .oauth as MCPBuiltinOAuthConfig
-  const { accessToken, expiresIn } = await issueToken({ req })
-
-  const code: Code = { accessToken, clientID, codeChallenge, expiresIn, redirectURI }
+  const code: Code = {
+    clientID,
+    codeChallenge,
+    redirectURI,
+    tokens: await getTokenHooks(req).issueToken({ req }),
+  }
 
   return redirect({
     params: { code: seal({ type: 'code', data: code, expiresIn: 60, req }), state },
@@ -237,56 +243,89 @@ const approve: PayloadHandler = async (req) => {
 
 const token: PayloadHandler = async (req) => {
   const form = new URLSearchParams(await req.text!())
-  const code = unseal<Code>({ type: 'code', req, value: form.get('code') })
+  const clientID = form.get('client_id')
+  const tokens =
+    clientID &&
+    (form.get('grant_type') === 'refresh_token'
+      ? await refresh({ clientID, form, req })
+      : redeemCode({ clientID, form, req }))
 
-  if (
-    form.get('grant_type') !== 'authorization_code' ||
-    !code ||
-    code.clientID !== form.get('client_id') ||
-    code.redirectURI !== form.get('redirect_uri') ||
-    // PKCE: only the client that started the sign-in knows the verifier
-    createHash('sha256')
-      .update(form.get('code_verifier') ?? '')
-      .digest('base64url') !== code.codeChallenge
-  ) {
+  if (!clientID || !tokens) {
     return Response.json({ error: OAuthErrorCode.InvalidGrant }, { status: 400 })
   }
 
   return Response.json(
     {
-      access_token: code.accessToken,
-      expires_in: code.expiresIn,
+      access_token: tokens.accessToken,
+      expires_in: tokens.expiresIn,
+      refresh_token:
+        tokens.refreshToken &&
+        seal({
+          type: 'refresh',
+          data: { clientID, refreshToken: tokens.refreshToken } satisfies RefreshToken,
+          req,
+        }),
       token_type: 'Bearer',
     } satisfies OAuthTokens,
     { headers: { 'Cache-Control': 'no-store' } },
   )
 }
 
-/** The default `issueToken`: a Payload login token, which Payload's JWT strategy accepts. */
-const issueLoginToken: NonNullable<MCPBuiltinOAuthConfig['issueToken']> = async ({ req }) => {
-  const collection = req.payload.collections[req.user!.collection]!
+const redeemCode = ({
+  clientID,
+  form,
+  req,
+}: {
+  clientID: string
+  form: URLSearchParams
+  req: PayloadRequest
+}): MCPOAuthTokens | undefined => {
+  const code = unseal<Code>({ type: 'code', req, value: form.get('code') })
 
-  if (collection.config.auth.disableLocalStrategy) {
-    throw new APIError(
-      `The "${collection.config.slug}" collection has its local strategy disabled, so MCP clients can't get Payload login tokens for it. Pass oauth.issueToken to the MCP plugin.`,
-    )
+  if (
+    form.get('grant_type') === 'authorization_code' &&
+    code?.clientID === clientID &&
+    code.redirectURI === form.get('redirect_uri') &&
+    // PKCE: only the client that started the sign-in knows the verifier
+    createHash('sha256')
+      .update(form.get('code_verifier') ?? '')
+      .digest('base64url') === code.codeChallenge
+  ) {
+    return code.tokens
   }
+}
 
-  // The full document, like the one a password login starts the session on
-  const user = (await req.payload.db.findOne<NonNullable<PayloadRequest['user']>>({
-    collection: collection.config.slug,
+const refresh = async ({
+  clientID,
+  form,
+  req,
+}: {
+  clientID: string
+  form: URLSearchParams
+  req: PayloadRequest
+}): Promise<MCPOAuthTokens | null | undefined> => {
+  const refreshToken = unseal<RefreshToken>({
+    type: 'refresh',
     req,
-    where: { id: { equals: req.user!.id } },
-  }))!
-
-  const { token } = await createAuthToken({
-    collectionConfig: collection.config,
-    email: user.email!,
-    req,
-    user,
+    value: form.get('refresh_token'),
   })
 
-  return { accessToken: token, expiresIn: collection.config.auth.tokenExpiration }
+  // Only the client a refresh token was issued to can use it
+  if (refreshToken?.clientID === clientID) {
+    return await getTokenHooks(req).refreshToken?.({
+      refreshToken: refreshToken.refreshToken,
+      req,
+    })
+  }
+}
+
+/** `issueToken` and `refreshToken`, or the defaults for Payload login tokens. */
+const getTokenHooks = (req: PayloadRequest) => {
+  const oauth = getPluginConfig({ config: req.payload.config }).oauth as MCPBuiltinOAuthConfig
+
+  return oauth.issueToken
+    ? { issueToken: oauth.issueToken, refreshToken: oauth.refreshToken }
+    : { issueToken: issueLoginToken, refreshToken: refreshLoginToken }
 }
 
 /**
@@ -324,7 +363,10 @@ const unseal = <T>({
   }
 
   try {
-    const data = JSON.parse(req.payload.decrypt(value))
+    // Previous secrets can be public, like a default secret from source code, so only client IDs
+    // accept them. Client IDs grant nothing, and this keeps clients registered when the secret changes.
+    const secret = type === 'client' ? undefined : req.payload.config.secret
+    const data = JSON.parse(req.payload.decrypt(value, { secret }))
     return data.type === type && (!data.exp || data.exp > Date.now()) ? data : undefined
   } catch {
     return undefined

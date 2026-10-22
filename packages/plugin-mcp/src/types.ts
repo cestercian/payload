@@ -323,17 +323,35 @@ export type MCPOAuthConfig = MCPBuiltinOAuthConfig | MCPExternalOAuthConfig
  */
 export type MCPBuiltinOAuthConfig = {
   /**
-   * Creates the access token the MCP client gets when the user clicks Allow. `req` is the user's
-   * own browser request, so `req.user` is the user who allowed it. Pass `authenticate` too if
-   * Payload's auth strategies don't accept the token.
+   * Creates the tokens the MCP client gets when the user clicks Allow. `req` is the user's own
+   * browser request, so `req.user` is the user who allowed it. Pass `authenticate` too if
+   * Payload's auth strategies don't accept the access token.
    *
-   * @default a Payload login token for that user
+   * @default a Payload login token for that user, with a refresh token when the collection uses sessions
    */
-  issueToken?: (args: {
+  issueToken?: (args: { req: PayloadRequest }) => MaybePromise<MCPOAuthTokens>
+  /**
+   * Trades a refresh token from `issueToken`, or from an earlier refresh, for new tokens. Return
+   * `null` when it's no longer valid, and the client sends the user through sign-in again. `req`
+   * is the MCP client's request, without a user. Only used together with `issueToken`.
+   *
+   * OAuth requires noticing copied refresh tokens: return a new refresh token every time, and
+   * revoke the tokens when an already used refresh token comes back.
+   */
+  refreshToken?: (args: {
+    refreshToken: string
     req: PayloadRequest
-  }) => MaybePromise<{ accessToken: string; expiresIn?: number }>
+  }) => MaybePromise<MCPOAuthTokens | null>
   type: 'builtin'
 } & MCPOAuthSharedConfig
+
+export type MCPOAuthTokens = {
+  accessToken: string
+  /** Seconds until the access token expires. */
+  expiresIn?: number
+  /** Lets the client get new tokens without the user, through `refreshToken`. */
+  refreshToken?: string
+}
 
 /** Another service, e.g. your identity provider, is the authorization server. */
 export type MCPExternalOAuthConfig = {

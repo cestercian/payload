@@ -5,6 +5,7 @@ import type {
   MCPBuiltinOAuthConfig,
   MCPExternalOAuthConfig,
   MCPOAuthConfig,
+  MCPOAuthTokens,
   MCPPluginConfig,
   SanitizedMCPPluginConfig,
 } from './types.js'
@@ -36,6 +37,7 @@ export type {
   MCPBuiltinOAuthConfig,
   MCPExternalOAuthConfig,
   MCPOAuthConfig,
+  MCPOAuthTokens,
   MCPPluginConfig,
   SanitizedMCPPluginConfig,
 }
